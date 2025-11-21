@@ -132,6 +132,17 @@ export class ProxyServer {
   }
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Health check endpoint
+    if (req.url === '/health' || req.url === '/_health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        timestamp: Date.now(),
+        uptime: process.uptime()
+      }));
+      return;
+    }
+
     const startTime = Date.now();
     const requestId = Math.random().toString(36).substring(2, 11);
 
