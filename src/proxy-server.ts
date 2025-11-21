@@ -5,6 +5,7 @@ import * as zlib from 'zlib';
 import chalk from 'chalk';
 import { marked } from 'marked';
 import TerminalRenderer from 'marked-terminal';
+import { FileLogger } from './file-logger';
 
 export interface ProxyServerOptions {
   localPort: number;
@@ -17,6 +18,10 @@ export interface ProxyServerOptions {
   debug?: boolean;
   chatMode?: boolean;
   verbose?: boolean;
+  // Multi-user options
+  multiUser?: boolean;
+  bindAddress?: string;
+  logsDir?: string;
 }
 
 interface SseEvent {
@@ -29,16 +34,34 @@ interface SseMessage {
   requestId: string;
   events: SseEvent[];
   mergedContent: string;
+  username?: string;
+}
+
+interface RequestContext {
+  requestId: string;
+  username: string;
+  startTime: number;
+}
+
+interface ParsedPath {
+  username: string | null;
+  actualPath: string;
 }
 
 export class ProxyServer {
   private server: http.Server | https.Server;
   private options: ProxyServerOptions;
   private sseMessages: Map<string, SseMessage> = new Map();
+  private fileLogger: FileLogger | null = null;
 
   constructor(options: ProxyServerOptions) {
     this.options = options;
-    
+
+    // Initialize multi-user components if enabled
+    if (options.multiUser) {
+      this.fileLogger = new FileLogger(options.logsDir);
+    }
+
     // Configure marked with terminal renderer
     marked.setOptions({
       renderer: new TerminalRenderer({
@@ -58,7 +81,7 @@ export class ProxyServer {
         href: chalk.blue.underline
       }) as any
     });
-    
+
     if (options.localHttps) {
       this.server = https.createServer(this.handleRequest.bind(this));
     } else {
@@ -70,7 +93,8 @@ export class ProxyServer {
 
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server.listen(this.options.localPort, () => {
+      const bindAddress = this.options.bindAddress || '127.0.0.1';
+      this.server.listen(this.options.localPort, bindAddress, () => {
         resolve();
       });
 
@@ -80,37 +104,95 @@ export class ProxyServer {
     });
   }
 
+  stop(): void {
+    this.server.close();
+    if (this.fileLogger) {
+      this.fileLogger.close();
+    }
+  }
+
+  /**
+   * Parse URL path to extract username and actual API path
+   * Format: /user/<username>/v1/messages -> { username: "username", actualPath: "/v1/messages" }
+   */
+  private parseUserPath(url: string | undefined): ParsedPath {
+    if (!url) {
+      return { username: null, actualPath: '/' };
+    }
+
+    // Match /user/<username>/<rest of path>
+    const match = url.match(/^\/user\/([^\/]+)(\/.*)?$/);
+    if (match) {
+      const username = match[1];
+      const actualPath = match[2] || '/';
+      return { username, actualPath };
+    }
+
+    return { username: null, actualPath: url };
+  }
+
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const startTime = Date.now();
     const requestId = Math.random().toString(36).substring(2, 11);
-    
-    let requestBody = Buffer.alloc(0);
-    
-    if (this.options.chatMode && this.options.debug) {
-      console.log(chalk.magenta(`🔍 CHAT DEBUG: handleRequest called for ${req.method} ${req.url}`));
+
+    // Parse user from URL path in multi-user mode
+    let username = 'anonymous';
+    let actualPath = req.url || '/';
+
+    if (this.options.multiUser) {
+      const parsed = this.parseUserPath(req.url);
+
+      if (!parsed.username) {
+        // No username in path - reject request
+        console.log(chalk.red(`[${requestId}] ❌ Missing user in URL path. Use /user/<username>/v1/messages`));
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request: URL must include user path. Format: /user/<username>/v1/messages');
+        return;
+      }
+
+      username = parsed.username;
+      actualPath = parsed.actualPath;
+
+      if (this.options.debug) {
+        console.log(chalk.magenta(`[${requestId}] 🔍 User: ${username}, Path: ${actualPath}`));
+      }
     }
-    
-    this.logRequest(requestId, req);
+
+    const context: RequestContext = {
+      requestId,
+      username,
+      startTime
+    };
+
+    let requestBody = Buffer.alloc(0);
+
+    if (this.options.chatMode && this.options.debug) {
+      this.debugLog(context, `handleRequest called for ${req.method} ${actualPath}`);
+    }
+
+    this.logRequest(context, req, actualPath);
 
     const options: http.RequestOptions | https.RequestOptions = {
       hostname: this.options.remoteHost,
       port: this.options.remotePort,
-      path: req.url,
+      path: actualPath,  // Use actual path without /user/<username>
       method: req.method,
       headers: { ...req.headers }
     };
 
+    // Remove proxy-specific headers before forwarding
     if (options.headers && typeof options.headers === 'object' && !Array.isArray(options.headers)) {
       delete (options.headers as any).host;
+      delete (options.headers as any)['proxy-authorization'];
       (options.headers as any).host = `${this.options.remoteHost}:${this.options.remotePort}`;
     }
 
-    const proxyReq = this.options.useHttps 
-      ? https.request(options, (proxyRes) => this.handleResponse(requestId, proxyRes, res, startTime))
-      : http.request(options, (proxyRes) => this.handleResponse(requestId, proxyRes, res, startTime));
+    const proxyReq = this.options.useHttps
+      ? https.request(options, (proxyRes) => this.handleResponse(context, proxyRes, res, req.headers))
+      : http.request(options, (proxyRes) => this.handleResponse(context, proxyRes, res, req.headers));
 
     proxyReq.on('error', (error) => {
-      console.error(chalk.red(`[${requestId}] ❌ Proxy request error:`), error.message);
+      this.errorLog(context, 'Proxy request error:', error.message);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'text/plain' });
         res.end('Proxy Error');
@@ -126,31 +208,31 @@ export class ProxyServer {
 
     req.on('end', () => {
       if (this.options.chatMode && this.options.debug) {
-        console.log(chalk.magenta(`🔍 CHAT DEBUG: Request ended, body length: ${requestBody.length}, logBody: ${this.options.logBody}`));
+        this.debugLog(context, `Request ended, body length: ${requestBody.length}`);
       }
-      
+
       if ((this.options.logBody || this.options.chatMode) && requestBody.length > 0) {
-        this.logRequestBody(requestId, requestBody, req.headers);
+        this.logRequestBody(context, requestBody, req.headers);
       }
       proxyReq.end();
     });
 
     req.on('error', (error) => {
-      console.error(chalk.red(`[${requestId}] ❌ Client request error:`), error.message);
+      this.errorLog(context, 'Client request error:', error.message);
       proxyReq.destroy();
     });
   }
 
   private handleResponse(
-    requestId: string, 
-    proxyRes: http.IncomingMessage, 
-    res: http.ServerResponse, 
-    startTime: number
+    context: RequestContext,
+    proxyRes: http.IncomingMessage,
+    res: http.ServerResponse,
+    _reqHeaders: http.IncomingHttpHeaders
   ): void {
-    const duration = Date.now() - startTime;
+    const duration = Date.now() - context.startTime;
     let responseBody = Buffer.alloc(0);
-    
-    this.logResponse(requestId, proxyRes, duration);
+
+    this.logResponse(context, proxyRes, duration);
 
     res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
 
@@ -163,17 +245,17 @@ export class ProxyServer {
 
     proxyRes.on('end', () => {
       if (this.options.chatMode && this.options.debug) {
-        console.log(chalk.magenta(`🔍 CHAT DEBUG: Response ended, body length: ${responseBody.length}, logBody: ${this.options.logBody}`));
+        this.debugLog(context, `Response ended, body length: ${responseBody.length}`);
       }
-      
+
       if ((this.options.logBody || this.options.chatMode) && responseBody.length > 0) {
-        this.logResponseBody(requestId, responseBody, proxyRes.headers);
+        this.logResponseBody(context, responseBody, proxyRes.headers);
       }
       res.end();
     });
 
     proxyRes.on('error', (error) => {
-      console.error(chalk.red(`[${requestId}] ❌ Proxy response error:`), error.message);
+      this.errorLog(context, 'Proxy response error:', error.message);
       if (!res.writableEnded) {
         res.end();
       }
@@ -182,12 +264,16 @@ export class ProxyServer {
 
   private handleConnect(req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer): void {
     const requestId = Math.random().toString(36).substring(2, 11);
-    const startTime = Date.now();
-    
+    const context: RequestContext = {
+      requestId,
+      username: 'tunnel',
+      startTime: Date.now()
+    };
+
     console.log(chalk.magenta(`[${requestId}] 🔒 CONNECT ${req.url}`));
 
     const { hostname, port } = this.parseConnectUrl(req.url || '');
-    
+
     const serverSocket = net.createConnection({
       host: hostname,
       port: parseInt(port)
@@ -196,18 +282,18 @@ export class ProxyServer {
       serverSocket.write(head);
       serverSocket.pipe(clientSocket);
       clientSocket.pipe(serverSocket);
-      
-      const duration = Date.now() - startTime;
+
+      const duration = Date.now() - context.startTime;
       console.log(chalk.green(`[${requestId}] ✅ CONNECT established (${duration}ms)`));
     });
 
     serverSocket.on('error', (error) => {
-      console.error(chalk.red(`[${requestId}] ❌ CONNECT error:`), error.message);
+      this.errorLog(context, 'CONNECT error:', error.message);
       clientSocket.end();
     });
 
     clientSocket.on('error', (error) => {
-      console.error(chalk.red(`[${requestId}] ❌ Client socket error:`), error.message);
+      this.errorLog(context, 'Client socket error:', error.message);
       serverSocket.end();
     });
   }
@@ -220,105 +306,137 @@ export class ProxyServer {
     };
   }
 
-  private logRequest(requestId: string, req: http.IncomingMessage): void {
-    if (this.options.chatMode && !this.options.logBody) {
-      return; // Skip regular request logging in chat mode unless log-body is also enabled
+  private formatPrefix(context: RequestContext): string {
+    if (this.options.multiUser) {
+      return `[${context.requestId}:${context.username}]`;
     }
-    
+    return `[${context.requestId}]`;
+  }
+
+  private debugLog(context: RequestContext, message: string): void {
+    console.log(chalk.magenta(`${this.formatPrefix(context)} 🔍 DEBUG: ${message}`));
+  }
+
+  private errorLog(context: RequestContext, label: string, message: string): void {
+    console.error(chalk.red(`${this.formatPrefix(context)} ❌ ${label}`), message);
+  }
+
+  private logRequest(context: RequestContext, req: http.IncomingMessage, actualPath?: string): void {
+    if (this.options.chatMode && !this.options.logBody) {
+      return;
+    }
+
+    const prefix = this.formatPrefix(context);
     const timestamp = new Date().toISOString();
     const method = req.method?.toUpperCase() || 'UNKNOWN';
-    const url = req.url || '/';
+    const url = actualPath || req.url || '/';
     const userAgent = req.headers['user-agent'] || 'Unknown';
-    
-    console.log(chalk.cyan(`[${requestId}] 📤 ${timestamp}`));
-    console.log(chalk.blue(`[${requestId}] ${method} ${url}`));
-    console.log(chalk.gray(`[${requestId}] User-Agent: ${userAgent}`));
-    
+
+    console.log(chalk.cyan(`${prefix} 📤 ${timestamp}`));
+    console.log(chalk.blue(`${prefix} ${method} ${url}`));
+    console.log(chalk.gray(`${prefix} User-Agent: ${userAgent}`));
+
     if (req.headers['content-length']) {
-      console.log(chalk.gray(`[${requestId}] Content-Length: ${req.headers['content-length']}`));
+      console.log(chalk.gray(`${prefix} Content-Length: ${req.headers['content-length']}`));
     }
-    
+
     if (req.headers['content-type']) {
-      console.log(chalk.gray(`[${requestId}] Content-Type: ${req.headers['content-type']}`));
+      console.log(chalk.gray(`${prefix} Content-Type: ${req.headers['content-type']}`));
+    }
+
+    // File logging
+    if (this.fileLogger && this.options.multiUser) {
+      this.fileLogger.logRequest(
+        context.username,
+        context.requestId,
+        method,
+        url
+      );
     }
   }
 
-  private logResponse(requestId: string, proxyRes: http.IncomingMessage, duration: number): void {
+  private logResponse(context: RequestContext, proxyRes: http.IncomingMessage, duration: number): void {
     if (this.options.chatMode && !this.options.logBody) {
-      return; // Skip regular response logging in chat mode unless log-body is also enabled
+      return;
     }
-    
+
+    const prefix = this.formatPrefix(context);
     const statusCode = proxyRes.statusCode || 0;
     const statusColor = statusCode >= 400 ? chalk.red : statusCode >= 300 ? chalk.yellow : chalk.green;
-    
-    console.log(chalk.cyan(`[${requestId}] 📥 Response`));
-    console.log(statusColor(`[${requestId}] ${statusCode} ${proxyRes.statusMessage || ''} (${duration}ms)`));
-    
+
+    console.log(chalk.cyan(`${prefix} 📥 Response`));
+    console.log(statusColor(`${prefix} ${statusCode} ${proxyRes.statusMessage || ''} (${duration}ms)`));
+
     if (proxyRes.headers['content-length']) {
-      console.log(chalk.gray(`[${requestId}] Content-Length: ${proxyRes.headers['content-length']}`));
+      console.log(chalk.gray(`${prefix} Content-Length: ${proxyRes.headers['content-length']}`));
     }
-    
+
     if (proxyRes.headers['content-type']) {
-      console.log(chalk.gray(`[${requestId}] Content-Type: ${proxyRes.headers['content-type']}`));
+      console.log(chalk.gray(`${prefix} Content-Type: ${proxyRes.headers['content-type']}`));
     }
-    
+
     console.log(chalk.gray('─'.repeat(60)));
+
+    // File logging
+    if (this.fileLogger && this.options.multiUser) {
+      this.fileLogger.logResponse(
+        context.username,
+        context.requestId,
+        statusCode,
+        duration
+      );
+    }
   }
 
-  private logRequestBody(requestId: string, body: Buffer, headers?: http.IncomingHttpHeaders): void {
+  private logRequestBody(context: RequestContext, body: Buffer, headers?: http.IncomingHttpHeaders): void {
     const contentEncoding = headers?.['content-encoding'] as string;
-    
+
     if (this.options.chatMode) {
       if (this.options.debug) {
-        console.log(chalk.magenta(`🔍 CHAT DEBUG: logRequestBody called with ${body.length} bytes`));
+        this.debugLog(context, `logRequestBody called with ${body.length} bytes`);
       }
-      // For chat mode, we need the full body to extract messages
       const fullBodyStr = this.getFullBody(body, contentEncoding);
-      this.extractChatMessage(requestId, fullBodyStr, 'user');
+      this.extractChatMessage(context, fullBodyStr, 'user');
     }
-    
-    // For display, use formatted (truncated) version
+
     const bodyStr = this.formatBody(body, contentEncoding);
-    
+
     if (this.options.logBody || this.options.chatMode) {
       if (this.options.chatMode) {
-        // Parse and format request in compact way
-        this.formatCompactRequest(requestId, bodyStr);
+        this.formatCompactRequest(context, bodyStr);
       } else {
-        console.log(chalk.cyan(`[${requestId}] 📤 Request Body:`));
+        const prefix = this.formatPrefix(context);
+        console.log(chalk.cyan(`${prefix} 📤 Request Body:`));
         console.log(chalk.gray(bodyStr));
       }
     }
   }
 
-  private logResponseBody(requestId: string, body: Buffer, headers?: http.IncomingHttpHeaders): void {
+  private logResponseBody(context: RequestContext, body: Buffer, headers?: http.IncomingHttpHeaders): void {
     const contentType = headers?.['content-type'] as string;
     const contentEncoding = headers?.['content-encoding'] as string;
-    
-    // Handle Server-Sent Events specially
+
     if ((this.options.mergeSse || this.options.chatMode) && contentType?.includes('text/event-stream')) {
-      this.processSseStream(requestId, body);
+      this.processSseStream(context, body);
       return;
     }
-    
+
     if (this.options.chatMode) {
       if (this.options.debug) {
-        console.log(chalk.magenta(`🔍 CHAT DEBUG: logResponseBody called with ${body.length} bytes, content-type: ${contentType}`));
+        this.debugLog(context, `logResponseBody called with ${body.length} bytes, content-type: ${contentType}`);
       }
-      // For chat mode, we need the full body to extract messages
       const fullBodyStr = this.getFullBody(body, contentEncoding);
-      this.extractChatMessage(requestId, fullBodyStr, 'assistant');
+      this.extractChatMessage(context, fullBodyStr, 'assistant');
     }
-    
-    // For display, use formatted (truncated) version
+
     const bodyStr = this.formatBody(body, contentEncoding);
-    
+
     if (this.options.logBody || this.options.chatMode) {
       if (this.options.chatMode) {
-        // Parse and format response in compact way
-        this.formatCompactResponse(requestId, bodyStr);
+        this.formatCompactResponse(context, bodyStr);
       } else {
-        console.log(chalk.cyan(`[${requestId}] 📥 Response Body:`));
+        const prefix = this.formatPrefix(context);
+        console.log(chalk.cyan(`${prefix} 📥 Response Body:`));
         console.log(chalk.gray(bodyStr));
         console.log(chalk.gray('─'.repeat(60)));
       }
@@ -327,7 +445,6 @@ export class ProxyServer {
 
   private getFullBody(body: Buffer, contentEncoding?: string): string {
     try {
-      // Handle compressed content
       let decompressedBody = body;
       if (contentEncoding) {
         try {
@@ -347,7 +464,6 @@ export class ProxyServer {
         }
       }
 
-      // Check if it's likely binary data
       if (this.isBinaryData(decompressedBody)) {
         return '';
       }
@@ -363,7 +479,6 @@ export class ProxyServer {
     let bodyStr: string;
 
     try {
-      // Handle compressed content
       let decompressedBody = body;
       if (contentEncoding) {
         try {
@@ -383,13 +498,12 @@ export class ProxyServer {
         }
       }
 
-      // Check if it's likely binary data
       if (this.isBinaryData(decompressedBody)) {
         return `<Binary data: ${body.length} bytes${contentEncoding ? ` (${contentEncoding})` : ''}>`;
       }
 
       bodyStr = decompressedBody.toString('utf8');
-      
+
       if (this.isJsonContent(bodyStr)) {
         try {
           const parsed = JSON.parse(bodyStr);
@@ -410,7 +524,6 @@ export class ProxyServer {
   }
 
   private isBinaryData(buffer: Buffer): boolean {
-    // Check for null bytes in first 512 bytes
     const sample = buffer.subarray(0, Math.min(512, buffer.length));
     for (let i = 0; i < sample.length; i++) {
       if (sample[i] === 0) {
@@ -422,36 +535,33 @@ export class ProxyServer {
 
   private isJsonContent(str: string): boolean {
     const trimmed = str.trim();
-    return (trimmed.startsWith('{') && trimmed.endsWith('}')) || 
+    return (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
            (trimmed.startsWith('[') && trimmed.endsWith(']'));
   }
 
   private containsMarkdown(text: string): boolean {
-    // Check for common markdown patterns
     const markdownPatterns = [
-      /^#{1,6}\s/m,           // Headers
-      /\*\*[^*]+\*\*/,        // Bold
-      /\*[^*]+\*/,            // Italic  
-      /\[([^\]]+)\]\([^)]+\)/, // Links
-      /^```[\s\S]*?```$/m,    // Code blocks
-      /`[^`]+`/,              // Inline code
-      /^[-*+]\s/m,            // Lists
-      /^\d+\.\s/m,            // Numbered lists
-      /^>\s/m,                // Blockquotes
-      /!\[([^\]]*)\]\([^)]+\)/ // Images
+      /^#{1,6}\s/m,
+      /\*\*[^*]+\*\*/,
+      /\*[^*]+\*/,
+      /\[([^\]]+)\]\([^)]+\)/,
+      /^```[\s\S]*?```$/m,
+      /`[^`]+`/,
+      /^[-*+]\s/m,
+      /^\d+\.\s/m,
+      /^>\s/m,
+      /!\[([^\]]*)\]\([^)]+\)/
     ];
-    
+
     return markdownPatterns.some(pattern => pattern.test(text));
   }
 
   private renderMarkdown(text: string): string {
     try {
-      // If it contains markdown, render it
       if (this.containsMarkdown(text)) {
         if (this.options.debug) {
           console.log(chalk.magenta('🔍 DEBUG: Rendering markdown for text:', text.substring(0, 50) + '...'));
         }
-        // Use parse instead of parseInline to support all markdown features
         const rendered = marked.parse(text) as string;
         if (this.options.debug) {
           console.log(chalk.magenta('🔍 DEBUG: Rendered result:', rendered.substring(0, 50) + '...'));
@@ -459,7 +569,6 @@ export class ProxyServer {
         return rendered;
       }
     } catch (error) {
-      // If rendering fails, return original text
       if (this.options.debug) {
         console.log(chalk.magenta('🔍 DEBUG: Markdown rendering failed:', error));
       }
@@ -467,103 +576,109 @@ export class ProxyServer {
     return text;
   }
 
-  private processSseStream(requestId: string, body: Buffer): void {
+  private processSseStream(context: RequestContext, body: Buffer): void {
     const bodyStr = body.toString('utf8');
     const events = this.parseSseEvents(bodyStr);
-    
+
     if (this.options.debug) {
-      console.log(chalk.magenta(`[${requestId}] 🔍 DEBUG: Processing ${body.length} bytes, found ${events.length} events`));
+      this.debugLog(context, `Processing ${body.length} bytes, found ${events.length} events`);
     }
-    
-    // Get or create SSE message tracker
-    let sseMessage = this.sseMessages.get(requestId);
+
+    let sseMessage = this.sseMessages.get(context.requestId);
     if (!sseMessage) {
       sseMessage = {
-        requestId,
+        requestId: context.requestId,
         events: [],
-        mergedContent: ''
+        mergedContent: '',
+        username: context.username
       };
-      this.sseMessages.set(requestId, sseMessage);
-      
+      this.sseMessages.set(context.requestId, sseMessage);
+
       if (!this.options.chatMode) {
-        console.log(chalk.cyan(`[${requestId}] 📥 SSE Stream Started:`));
+        const prefix = this.formatPrefix(context);
+        console.log(chalk.cyan(`${prefix} 📥 SSE Stream Started:`));
       } else {
-        // In chat mode, show the assistant prefix when starting a new stream
-        process.stdout.write(chalk.blue('🤖 '));
+        const userPrefix = this.options.multiUser ? chalk.gray(`[${context.username}] `) : '';
+        process.stdout.write(userPrefix + chalk.blue('🤖 '));
       }
     }
-    
-    // Add new events
+
     sseMessage.events.push(...events);
-    
-    // Debug: Show event types
+
     const eventTypes = events.map(e => e.event).filter(Boolean);
     if (this.options.debug && eventTypes.length > 0) {
-      console.log(chalk.magenta(`[${requestId}] 🔍 DEBUG: Event types: ${eventTypes.join(', ')}`));
+      this.debugLog(context, `Event types: ${eventTypes.join(', ')}`);
     }
-    
-    // Extract and merge text content
+
     const textDeltas = events
       .filter(event => event.event === 'content_block_delta')
       .map(event => {
         try {
           const data = JSON.parse(event.data || '{}');
           if (this.options.debug) {
-            console.log(chalk.magenta(`[${requestId}] 🔍 DEBUG: Delta data: ${JSON.stringify(data)}`));
+            this.debugLog(context, `Delta data: ${JSON.stringify(data)}`);
           }
           const text = data.delta?.text || '';
           if (this.options.debug) {
-            console.log(chalk.magenta(`[${requestId}] 🔍 DEBUG: Extracted text: "${text}"`));
+            this.debugLog(context, `Extracted text: "${text}"`);
           }
           return text;
         } catch (error) {
           if (this.options.debug) {
-            console.log(chalk.red(`[${requestId}] 🔍 DEBUG: JSON parse error: ${error}`));
+            this.debugLog(context, `JSON parse error: ${error}`);
           }
           return '';
         }
       })
       .filter(text => text.length > 0);
-    
+
     if (this.options.debug) {
-      console.log(chalk.magenta(`[${requestId}] 🔍 DEBUG: Found ${textDeltas.length} text deltas: ${JSON.stringify(textDeltas)}`));
+      this.debugLog(context, `Found ${textDeltas.length} text deltas: ${JSON.stringify(textDeltas)}`);
     }
-    
+
     if (textDeltas.length > 0) {
       const newText = textDeltas.join('');
       sseMessage.mergedContent += newText;
-      
-      if (this.options.chatMode) {
-        // In chat mode, collect text but don't display during streaming
-        // We'll render everything with markdown at the end
-      } else {
-        console.log(chalk.gray(`[${requestId}] 📝 +${newText}`));
+
+      if (!this.options.chatMode) {
+        const prefix = this.formatPrefix(context);
+        console.log(chalk.gray(`${prefix} 📝 +${newText}`));
       }
     }
-    
-    // Check if stream is complete
+
     const hasMessageStop = events.some(event => event.event === 'message_stop');
     const hasContentBlockStop = events.some(event => event.event === 'content_block_stop');
     const hasMessageDelta = events.some(event => event.event === 'message_delta' && event.data?.includes('stop_reason'));
-    
+
     if (this.options.debug) {
-      console.log(chalk.magenta(`[${requestId}] 🔍 DEBUG: Stream end check - message_stop: ${hasMessageStop}, content_block_stop: ${hasContentBlockStop}, message_delta: ${hasMessageDelta}`));
+      this.debugLog(context, `Stream end check - message_stop: ${hasMessageStop}, content_block_stop: ${hasContentBlockStop}, message_delta: ${hasMessageDelta}`);
     }
-    
+
     if (hasMessageStop || hasContentBlockStop || hasMessageDelta) {
       if (this.options.chatMode) {
-        // In chat mode, render the complete message with markdown
         if (sseMessage.mergedContent) {
+          const userPrefix = this.options.multiUser ? chalk.gray(`[${context.username}] `) : '';
           const rendered = this.renderMarkdown(sseMessage.mergedContent);
-          console.log(chalk.blue('🤖 ') + rendered.trim());
+          console.log(userPrefix + chalk.blue('🤖 ') + rendered.trim());
+
+          // File logging for chat
+          if (this.fileLogger && this.options.multiUser) {
+            this.fileLogger.logChatMessage(
+              context.username,
+              context.requestId,
+              'assistant',
+              sseMessage.mergedContent
+            );
+          }
         }
       } else {
-        console.log(chalk.cyan(`[${requestId}] 📥 SSE Complete Message:`));
+        const prefix = this.formatPrefix(context);
+        console.log(chalk.cyan(`${prefix} 📥 SSE Complete Message:`));
         const rendered = this.renderMarkdown(sseMessage.mergedContent || '<empty message>');
         console.log(chalk.green(rendered));
         console.log(chalk.gray('─'.repeat(60)));
       }
-      this.sseMessages.delete(requestId);
+      this.sseMessages.delete(context.requestId);
     }
   }
 
@@ -571,17 +686,13 @@ export class ProxyServer {
     const events: SseEvent[] = [];
     const lines = sseData.split('\n');
     let currentEvent: SseEvent = {};
-    
-    // Debug logging handled in processSseStream
-    
+
     for (const line of lines) {
       const trimmedLine = line.trim();
-      
+
       if (trimmedLine === '') {
-        // Empty line indicates end of event
         if (Object.keys(currentEvent).length > 0) {
           events.push(currentEvent);
-          // Debug logging handled in processSseStream
           currentEvent = {};
         }
       } else if (trimmedLine.startsWith('event:')) {
@@ -593,41 +704,37 @@ export class ProxyServer {
         currentEvent.id = trimmedLine.substring(3).trim();
       }
     }
-    
-    // Add last event if exists
+
     if (Object.keys(currentEvent).length > 0) {
       events.push(currentEvent);
-      // Debug logging handled in processSseStream
     }
-    
+
     return events;
   }
 
-  private formatCompactRequest(_requestId: string, bodyStr: string): void {
+  private formatCompactRequest(context: RequestContext, bodyStr: string): void {
+    const prefix = this.formatPrefix(context);
     try {
       const data = JSON.parse(bodyStr);
-      
-      // System prompts - show full content
+
       if (data.system && Array.isArray(data.system)) {
         data.system.forEach((s: any) => {
           if (s.text) {
-            console.log(chalk.yellow(`  📋 System:`));
-            console.log(chalk.gray(`  ${s.text}`));
+            console.log(chalk.yellow(`${prefix}   📋 System:`));
+            console.log(chalk.gray(`${prefix}   ${s.text}`));
           }
         });
       }
-      
-      // Show request size for debugging
-      console.log(chalk.gray(`  📦 Request: ${bodyStr.length} bytes`));
-      
+
+      console.log(chalk.gray(`${prefix}   📦 Request: ${bodyStr.length} bytes`));
+
       if (this.options.debug) {
-        // In debug mode, show if there are large content blocks
         if (data.messages && Array.isArray(data.messages)) {
           data.messages.forEach((msg: any, idx: number) => {
             if (Array.isArray(msg.content)) {
               msg.content.forEach((item: any) => {
                 if (item.type === 'text' && item.text && item.text.length > 1000) {
-                  console.log(chalk.magenta(`  🔍 DEBUG: Message[${idx}] contains ${item.text.length} chars`));
+                  this.debugLog(context, `Message[${idx}] contains ${item.text.length} chars`);
                 }
               });
             }
@@ -638,53 +745,55 @@ export class ProxyServer {
       // Not JSON
     }
   }
-  
-  private formatCompactResponse(_requestId: string, _bodyStr: string): void {
+
+  private formatCompactResponse(_context: RequestContext, _bodyStr: string): void {
     // In chat mode, we only care about the prompts/content, not metadata
-    // Response content is already handled by extractChatMessage
   }
-  
-  private extractChatMessage(_requestId: string, bodyStr: string, role: 'user' | 'assistant'): void {
+
+  private extractChatMessage(context: RequestContext, bodyStr: string, role: 'user' | 'assistant'): void {
     if (this.options.debug) {
-      console.log(chalk.magenta(`🔍 CHAT DEBUG: Extracting ${role} message from ${bodyStr.length} chars`));
+      this.debugLog(context, `Extracting ${role} message from ${bodyStr.length} chars`);
     }
-    
+
+    const prefix = this.formatPrefix(context);
+    const userPrefix = this.options.multiUser ? chalk.gray(`[${context.username}] `) : '';
+
     try {
       const data = JSON.parse(bodyStr);
       if (this.options.debug) {
-        console.log(chalk.magenta(`🔍 CHAT DEBUG: Parsed JSON for ${role}:`, JSON.stringify(data, null, 2).substring(0, 200)));
+        this.debugLog(context, `Parsed JSON for ${role}: ${JSON.stringify(data, null, 2).substring(0, 200)}`);
       }
-      
+
       if (role === 'user' && data.messages && Array.isArray(data.messages)) {
         if (this.options.debug) {
-          console.log(chalk.magenta(`🔍 CHAT DEBUG: Found ${data.messages.length} messages`));
+          this.debugLog(context, `Found ${data.messages.length} messages`);
         }
-        
-        // Extract ALL messages to see the full conversation
+
         data.messages.forEach((message: any, idx: number) => {
           if (this.options.debug && idx === data.messages.length - 1) {
-            console.log(chalk.magenta(`🔍 CHAT DEBUG: Message[${idx}]:`, JSON.stringify(message).substring(0, 200)));
+            this.debugLog(context, `Message[${idx}]: ${JSON.stringify(message).substring(0, 200)}`);
           }
-          
+
           if (message.role === 'user') {
             console.log('');
-            
-            // Handle different content formats
+
             if (typeof message.content === 'string') {
               const rendered = this.renderMarkdown(message.content);
-              console.log(chalk.green('👤 ') + rendered);
+              console.log(userPrefix + chalk.green('👤 ') + rendered);
+
+              // File logging
+              if (this.fileLogger && this.options.multiUser) {
+                this.fileLogger.logChatMessage(context.username, context.requestId, 'user', message.content);
+              }
             } else if (Array.isArray(message.content)) {
-              // Complex content array
               message.content.forEach((item: any) => {
                 if (item.type === 'text' && item.text) {
-                  // Parse and display content smartly
                   if (item.text.includes('<system-reminder>')) {
-                    // Extract and show system reminders
                     const reminders = item.text.match(/<system-reminder>([\s\S]*?)<\/system-reminder>/g);
                     if (reminders) {
                       reminders.forEach((reminder: string) => {
                         const content = reminder.replace(/<\/?system-reminder>/g, '').trim();
-                        console.log(chalk.yellow('  📋 System Reminder:'));
+                        console.log(userPrefix + chalk.yellow('  📋 System Reminder:'));
                         if (this.options.verbose) {
                           console.log(chalk.gray('  ' + content));
                         } else {
@@ -692,18 +801,20 @@ export class ProxyServer {
                         }
                       });
                     }
-                    
-                    // Extract the actual user message
+
                     const userPart = item.text.split('</system-reminder>').pop()?.trim();
                     if (userPart && userPart.length > 0) {
                       const rendered = this.renderMarkdown(userPart);
-                      console.log(chalk.green('👤 ') + rendered);
+                      console.log(userPrefix + chalk.green('👤 ') + rendered);
+
+                      if (this.fileLogger && this.options.multiUser) {
+                        this.fileLogger.logChatMessage(context.username, context.requestId, 'user', userPart);
+                      }
                     }
                   } else if (item.text.includes('Contents of') && item.text.includes('```')) {
-                    // File content
                     const fileMatch = item.text.match(/Contents of ([^:]+):/);
                     if (fileMatch) {
-                      console.log(chalk.cyan(`  📄 File: ${fileMatch[1]}`));
+                      console.log(userPrefix + chalk.cyan(`  📄 File: ${fileMatch[1]}`));
                       if (this.options.verbose) {
                         console.log(chalk.gray('  ' + item.text));
                       } else {
@@ -711,22 +822,21 @@ export class ProxyServer {
                       }
                     }
                   } else {
-                    // Regular message
                     const rendered = this.renderMarkdown(item.text);
-                    console.log(chalk.green('👤 ') + rendered);
+                    console.log(userPrefix + chalk.green('👤 ') + rendered);
+
+                    if (this.fileLogger && this.options.multiUser) {
+                      this.fileLogger.logChatMessage(context.username, context.requestId, 'user', item.text);
+                    }
                   }
                 } else if (item.type === 'tool_result' && item.content) {
-                  // Tool results (like file reads)
-                  console.log(chalk.cyan('  🔧 Tool Result:'));
-                  // Check if it looks like file content with line numbers
+                  console.log(userPrefix + chalk.cyan('  🔧 Tool Result:'));
                   if (item.content.match(/^\s*\d+→/m)) {
                     const lines = item.content.split('\n');
                     console.log(chalk.gray(`  [${lines.length} lines of file content]`));
                     if (this.options.verbose) {
-                      // Show all lines
                       console.log(chalk.gray('  ' + lines.join('\n  ')));
                     } else {
-                      // Show first few lines
                       console.log(chalk.gray('  ' + lines.slice(0, 5).join('\n  ')));
                       if (lines.length > 5) {
                         console.log(chalk.gray('  ...'));
@@ -743,50 +853,52 @@ export class ProxyServer {
               });
             }
           } else if (message.role === 'assistant' && idx < data.messages.length - 1) {
-            // Show previous assistant messages in the conversation
-            const content = typeof message.content === 'string' 
-              ? message.content 
+            const content = typeof message.content === 'string'
+              ? message.content
               : message.content?.[0]?.text || '';
             if (content) {
               const rendered = this.renderMarkdown(content);
               if (this.options.verbose) {
-                console.log(chalk.blue('🤖 ') + chalk.gray('[previous] ') + rendered);
+                console.log(userPrefix + chalk.blue('🤖 ') + chalk.gray('[previous] ') + rendered);
               } else {
                 const truncated = content.substring(0, 100) + '...';
                 const renderedTruncated = this.renderMarkdown(truncated);
-                console.log(chalk.blue('🤖 ') + chalk.gray('[previous] ') + renderedTruncated);
+                console.log(userPrefix + chalk.blue('🤖 ') + chalk.gray('[previous] ') + renderedTruncated);
               }
             }
           }
         });
       } else if (role === 'assistant' && data.content && Array.isArray(data.content)) {
         if (this.options.debug) {
-          console.log(chalk.magenta(`🔍 CHAT DEBUG: Assistant response with ${data.content.length} content items`));
+          this.debugLog(context, `Assistant response with ${data.content.length} content items`);
         }
-        
-        // Extract assistant message from non-streaming response
+
         const textContent = data.content
           .filter((item: any) => item.type === 'text')
           .map((item: any) => item.text)
           .join('');
-        
+
         if (this.options.debug) {
-          console.log(chalk.magenta(`🔍 CHAT DEBUG: Assistant text content: "${textContent}"`));
+          this.debugLog(context, `Assistant text content: "${textContent}"`);
         }
-        
+
         if (textContent.trim()) {
           const rendered = this.renderMarkdown(textContent);
-          console.log(chalk.blue('🤖 ') + rendered);
+          console.log(userPrefix + chalk.blue('🤖 ') + rendered);
+
+          if (this.fileLogger && this.options.multiUser) {
+            this.fileLogger.logChatMessage(context.username, context.requestId, 'assistant', textContent);
+          }
         }
       } else {
         if (this.options.debug) {
-          console.log(chalk.magenta(`🔍 CHAT DEBUG: No matching pattern for ${role}. Data keys:`, Object.keys(data)));
+          this.debugLog(context, `No matching pattern for ${role}. Data keys: ${Object.keys(data)}`);
         }
       }
     } catch (error) {
       if (this.options.debug) {
-        console.log(chalk.red(`🔍 CHAT DEBUG: JSON parse error for ${role}:`, error));
-        console.log(chalk.red(`🔍 CHAT DEBUG: Raw body:`, bodyStr.substring(0, 200)));
+        console.log(chalk.red(`${prefix} 🔍 DEBUG: JSON parse error for ${role}:`, error));
+        console.log(chalk.red(`${prefix} 🔍 DEBUG: Raw body:`, bodyStr.substring(0, 200)));
       }
     }
   }
