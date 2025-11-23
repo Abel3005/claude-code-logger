@@ -105,3 +105,7 @@ The proxy server:
 **Logging**: `FileLogger` writes JSONL files per user per day:
 - `logs/<username>/YYYY-MM-DD-raw.jsonl` - Raw request/response logs
 - `logs/<username>/YYYY-MM-DD-chat.jsonl` - Chat messages only
+
+**Health Endpoints**: Available for monitoring:
+- `/health` or `/_health` - Global health check (no user required)
+- `/user/<username>/health` - User-specific health check in multi-user mode

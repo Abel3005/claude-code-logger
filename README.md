@@ -42,6 +42,12 @@ npx claude-code-logger start --help
 - **🔧 Tool Usage Tracking**: Monitor when Claude uses tools like file reading, editing, or web searches
 - **📊 Verbose Mode**: Use `-v` flag to see full prompts without truncation
 
+### Multi-User Mode
+- **👥 Shared Server**: Multiple users can share a single proxy server
+- **🔗 URL-based Identification**: Users identified by URL path (`/user/<username>/...`)
+- **📁 Per-user Logging**: Each user's traffic logged to separate JSONL files
+- **🚀 No Pre-registration**: Users are automatically recognized
+
 ### General Proxy Features
 - **✅ HTTP and HTTPS Support**: Works with both protocols
 - **✅ Request/Response Logging**: Detailed logging of all traffic
@@ -49,8 +55,11 @@ npx claude-code-logger start --help
 - **✅ Server-Sent Events (SSE)**: Proper handling and merging of streaming responses
 - **✅ Compression Support**: Handles gzip, deflate, and brotli compressed responses
 - **✅ Parallel Request Handling**: Efficiently handles multiple concurrent requests
+- **❤️ Health Endpoints**: `/health` for monitoring
 
 ## 📋 All CLI Options
+
+### Single-User Mode (start)
 
 ```bash
 claude-code-logger start [options]
@@ -65,6 +74,22 @@ Options:
   --merge-sse               Merge Server-Sent Events into readable messages (default: false)
   --debug                   Show debug messages for troubleshooting (default: false)
   --chat-mode               Show only chat conversation with live streaming (default: true)
+  -v, --verbose             Show full prompts without truncation (default: false)
+```
+
+### Multi-User Mode (server)
+
+```bash
+claude-code-logger server [options]
+
+Options:
+  -p, --port <port>         Local port to listen on (default: 8000)
+  -b, --bind <address>      Bind address, 0.0.0.0 for all interfaces (default: 0.0.0.0)
+  -h, --host <host>         Remote host address (default: api.anthropic.com)
+  -r, --remote-port <port>  Remote port (default: 443)
+  --logs-dir <path>         Directory for log files (default: ./logs)
+  --https                   Use HTTPS for remote connection (default: true)
+  --debug                   Show debug messages for troubleshooting (default: false)
   -v, --verbose             Show full prompts without truncation (default: false)
 ```
 
@@ -87,6 +112,30 @@ ANTHROPIC_BASE_URL=http://localhost:8000/ claude
 # Log to file for later analysis
 npm run dev -- start 2>&1 | tee claude-session-$(date +%Y%m%d-%H%M%S).log
 ```
+
+### Multi-User Mode (Team/Server Setup)
+
+**Server side:**
+```bash
+# Start multi-user server (binds to all interfaces)
+npx claude-code-logger server -p 8000
+
+# Or with specific bind address
+npx claude-code-logger server -p 8000 -b 192.168.1.100
+```
+
+**Client side (each user):**
+```bash
+# Alice's configuration
+export ANTHROPIC_BASE_URL="http://<server-ip>:8000/user/alice"
+claude
+
+# Bob's configuration
+export ANTHROPIC_BASE_URL="http://<server-ip>:8000/user/bob"
+claude
+```
+
+Logs are saved to `logs/<username>/YYYY-MM-DD-*.jsonl` for each user.
 
 ### General Proxy Usage
 ```bash
@@ -131,8 +180,11 @@ with open('filename.txt', 'r') as file:
 # Install dependencies
 npm install
 
-# Run in development mode
+# Run in development mode (single-user)
 npm run dev -- start
+
+# Run in development mode (multi-user)
+npm run dev -- server
 
 # Build for production
 npm run build

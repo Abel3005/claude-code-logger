@@ -359,6 +359,7 @@ export class ProxyServer {
     console.log(chalk.blue(`${prefix} ${method} ${url}`));
     console.log(chalk.gray(`${prefix} User-Agent: ${userAgent}`));
 
+
     if (req.headers['content-length']) {
       console.log(chalk.gray(`${prefix} Content-Length: ${req.headers['content-length']}`));
     }
